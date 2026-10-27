@@ -5,6 +5,18 @@
 
 [CrossPoint Reader](https://github.com/crosspoint-reader/crosspoint-reader) 2.0.0rc を元に、**日本語の本文を読むときの表示**を改善した、個人の改造版です。
 
+## 本家との違いを見るには
+
+- **変更の全部(本家 2.0.0rc との差分):**
+  [ファーム](https://github.com/crosspoint-reader/crosspoint-reader/compare/2.0.0rc...homunet:crosspoint-reader-jp:jp/2.0.0rc)
+  と、[表示ドライバ(freeink-sdk のフォーク)](https://github.com/Free-Ink/freeink-sdk/compare/f9cc1beda45f4d2d3dade69fc444165727424f53...homunet:freeink-sdk:jp/window-gray)。
+  GitHub の「Files changed」で、変更されたファイルと内容を確認できます。
+- **変更の理由:** 各コミットの説明文に、何を・なぜ変えたかを書いています(下の「変更の一覧」)。
+- **本家のリポジトリ:** <https://github.com/crosspoint-reader/crosspoint-reader>
+- **ページ上部の「N commits behind」の表示について:** 本家のその後の開発(`develop`)に追いついていない数を表すだけです。
+  このフォークは、本家のタグ **2.0.0rc** から作っています。2.0.0rc に対しては、本家に無い変更だけが乗っています。
+- **配布ファイル:** [Releases](https://github.com/homunet/crosspoint-reader-jp/releases)
+
 ## 何が変わるか
 
 文字(アンチエイリアスの灰色を含む)のページを、次のように表示します。

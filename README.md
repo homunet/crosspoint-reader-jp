@@ -2,7 +2,13 @@
 
 > **Unofficial fork for Japanese reading (Xteink X4).** Text pages are shown with one refresh using the factory
 > 4-level waveform, so the coarse bold first frame is gone. Not affiliated with CrossPoint Reader, FreeInk or
-> Xteink; no warranty; flash at your own risk. See [README.ja.md](./README.ja.md) (Japanese).
+> Xteink; no warranty; flash at your own risk. Japanese documentation: [README.ja.md](./README.ja.md).
+>
+> **本家との違い / Differences from upstream**
+> - [**Full list of changes (diff against upstream 2.0.0rc)**](https://github.com/crosspoint-reader/crosspoint-reader/compare/2.0.0rc...homunet:crosspoint-reader-jp:jp/2.0.0rc)
+>   — the display driver changes are in the [freeink-sdk fork](https://github.com/Free-Ink/freeink-sdk/compare/f9cc1beda45f4d2d3dade69fc444165727424f53...homunet:freeink-sdk:jp/window-gray).
+> - Based on the upstream tag **2.0.0rc**, not on the latest `develop`. GitHub's "N commits behind" only counts newer upstream work.
+> - Download: [Releases](https://github.com/homunet/crosspoint-reader-jp/releases) (`firmware.bin`, Xteink X4 only).
 
 [![Fund contributors](https://img.shields.io/badge/%F0%9F%91%91_Fund_contributors-royalty.dev-BB953A?style=for-the-badge&labelColor=1a1a1a)](https://app.royalty.dev/crosspoint-reader/crosspoint-reader)
 
