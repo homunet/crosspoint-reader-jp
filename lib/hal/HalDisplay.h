@@ -113,6 +113,12 @@ class HalDisplay {
   void writeGrayscalePlaneStrip(bool lsbPlane, const uint8_t* rows, uint16_t yStart, uint16_t numRows);
   bool supportsStripGrayscale() const;
 
+  // Overlay gray planes can also be written into a byte-aligned rectangle of controller RAM
+  // (EInkDisplay::writeGrayscalePlaneWindow). `data` is h rows of w / 8 bytes.
+  bool supportsGrayscaleWindow() const;
+  void declareGrayscaleWindowsComplete();
+  bool writeGrayscalePlaneWindow(bool lsbPlane, const uint8_t* data, uint16_t x, uint16_t y, uint16_t w, uint16_t h);
+
   // True when displayGrayscaleBase() defers the base activation so the gray
   // planes join it in a single waveform (Paper Mono). Callers should then route
   // the base of a grayscale page through displayGrayscaleBase() instead of

@@ -92,6 +92,14 @@ class GfxRenderer {
   mutable uint8_t* _stripBuf = nullptr;
   mutable int _stripY0 = 0;
   mutable int _stripRows = 0;
+  // Horizontal extent of the active target. A full-width strip uses x0 = 0 and the whole
+  // panel width; a window target (beginWindowTarget) is a smaller rectangle.
+  // Optional second target (MSB plane) written together with _stripBuf (LSB plane); see
+  // beginWindowTarget. Same geometry as _stripBuf.
+  mutable uint8_t* _stripBuf2 = nullptr;
+  mutable int _stripX0 = 0;
+  mutable int _stripW = 0;
+  mutable int _stripStride = 0;
   mutable bool _stripActive = false;
   mutable int clipLeft_ = 0;
   mutable int clipTop_ = 0;
@@ -273,6 +281,27 @@ class GfxRenderer {
   void beginStripTarget(uint8_t* scratch, int stripY0, int stripRows) const;
   void endStripTarget() const;
 
+  // Window target: like beginStripTarget but for a physical rectangle. `buf` holds h rows of
+  // w / 8 bytes each (row 0 = physical row y, byte 0 = physical column x). x and w must be
+  // multiples of 8. Pixels outside the rectangle are dropped. Ends with endStripTarget().
+  // Text, lines and solid fills honor the window; image writers (DirectPixelWriter) do not,
+  // so do not render images into a window target.
+  // With `buf2` set, text drawn in a gray render mode paints the LSB plane into `buf` and the
+  // MSB plane into `buf2` in a single page walk (both buffers hold h rows of w / 8 bytes).
+  void beginWindowTarget(uint8_t* buf, int x, int y, int w, int h, uint8_t* buf2 = nullptr) const;
+
+  // Physical (panel-memory) rectangle covering a logical rectangle, with x and w snapped
+  // outward to multiples of 8. Returns false when the rectangle is empty or off-panel.
+  bool logicalRectToPanelRect(int lx, int ly, int lw, int lh, int* x, int* y, int* w, int* h) const;
+
+  // Write one gray plane into the controller RAM window (see HalDisplay). Returns false when
+  // the panel cannot do it; callers then fall back to full-width strips.
+  bool supportsGrayscaleWindow() const;
+  bool writeGrayscalePlaneWindow(bool lsbPlane, const uint8_t* data, int x, int y, int w, int h) const;
+  // Absolute gray mode only: call once the windows written so far tile the whole panel, so the
+  // pending gray pass may be displayed.
+  void declareGrayscaleWindowsComplete() const;
+
   // Band culling for tiled grayscale. Takes a glyph bounding box in logical
   // screen coords and returns false only when a strip is active AND the box's
   // physical y-extent lies entirely outside the active band, letting callers
@@ -288,6 +317,11 @@ class GfxRenderer {
   uint8_t* getWriteTarget() const { return _stripActive ? _stripBuf : frameBuffer; }
   int getWriteOriginY() const { return _stripActive ? _stripY0 : 0; }
   int getWriteRows() const { return _stripActive ? _stripRows : panelHeight; }
+  int getWriteOriginX() const { return _stripActive ? _stripX0 : 0; }
+  int getWriteWidth() const { return _stripActive ? _stripW : panelWidth; }
+  int getWriteStride() const { return _stripActive ? _stripStride : panelWidthBytes; }
+  // True while a dual-plane window target is active (see beginWindowTarget).
+  bool hasDualTarget() const { return _stripActive && _stripBuf2 != nullptr; }
 
   // Drawing
   // UI drawing clip in logical coordinates; independent of panel orientation.

@@ -470,7 +470,7 @@ static void renderCharScaled(const GfxRenderer& renderer, GfxRenderer::RenderMod
                              const EpdFontFamily& fontFamily, const uint32_t cp, int cursorX, int cursorY,
                              const bool pixelState, const EpdFontFamily::Style style, const int scaleNum,
                              const int scaleDen) {
-  if (renderer.grayPlanesAreAbsolute()) renderMode = GfxRenderer::BW;
+  if (renderer.grayPlanesAreAbsolute() && !renderer.hasDualTarget()) renderMode = GfxRenderer::BW;
   EpdGlyph solidFallback;
   const EpdGlyph* glyph = fontFamily.getGlyphMetrics(cp, solidFallback, style);
   if (!glyph) return;
@@ -530,7 +530,7 @@ template <TextRotation rotation = TextRotation::None>
 static void renderCharImpl(const GfxRenderer& renderer, GfxRenderer::RenderMode renderMode,
                            const EpdFontFamily& fontFamily, const uint32_t cp, int cursorX, int cursorY,
                            const bool pixelState, const EpdFontFamily::Style style) {
-  if (renderer.grayPlanesAreAbsolute()) renderMode = GfxRenderer::BW;
+  if (renderer.grayPlanesAreAbsolute() && !renderer.hasDualTarget()) renderMode = GfxRenderer::BW;
   EpdGlyph solidFallback;
   const EpdGlyph* glyph = fontFamily.getGlyphMetrics(cp, solidFallback, style);
   if (!glyph) {
@@ -598,7 +598,7 @@ void GfxRenderer::drawGlyphBitmap(const uint8_t* bitmap, const int width, const 
 
   // Writes go to the framebuffer, or to the strip scratch in tiled grayscale
   // mode; getWriteOriginY()/getWriteRows() bound the rows that exist there.
-  glyphBitmap::Target target{getWriteTarget(), panelWidth, panelWidthBytes, getWriteOriginY(), getWriteRows(), {}};
+  glyphBitmap::Target target{getWriteTarget(), getWriteWidth(), getWriteStride(), getWriteOriginY(), getWriteRows(), {}};
   // Rotate the glyph origin once, then derive the two physical axes by
   // rotating its neighbours along each logical axis. Together these encode
   // the text rotation and the panel orientation as one orthogonal transform.
@@ -611,6 +611,13 @@ void GfxRenderer::drawGlyphBitmap(const uint8_t* bitmap, const int width, const 
   rotateCoordinates(orientation, frame.x + frame.dyX, frame.y + frame.dyY, &nextX, &nextY, panelWidth, panelHeight);
   physical.dyX = nextX - physical.x;
   physical.dyY = nextY - physical.y;
+  // Window target: express the glyph origin relative to the window's left edge.
+  physical.x -= getWriteOriginX();
+  // Dual-plane window target: the MSB plane shares the geometry of the LSB plane.
+  if (mode != BW && _stripActive) {
+    target.buffer2 = _stripBuf2;
+    target.absoluteLevels = _stripBuf2 != nullptr && absoluteGrayPlanes;
+  }
 
   const glyphBitmap::Plane plane = mode == BW              ? glyphBitmap::Plane::BW
                                    : mode == GRAYSCALE_MSB ? glyphBitmap::Plane::GrayMSB
@@ -637,23 +644,31 @@ void GfxRenderer::drawPixel(const int x, const int y, const bool state) const {
   // Tiled grayscale: redirect writes to the strip scratch and clip to the
   // current band. Single predictable branch on the hot per-pixel path.
   uint8_t* target = frameBuffer;
+  uint8_t* target2 = nullptr;  // dual-plane window target only
   uint32_t rowY = static_cast<uint32_t>(phyY);
+  uint32_t stride = panelWidthBytes;
+  int colX = phyX;
   if (_stripActive) {
-    if (phyY < _stripY0 || phyY >= _stripY0 + _stripRows) {
-      return;  // pixel outside the band currently being rendered
+    if (phyY < _stripY0 || phyY >= _stripY0 + _stripRows || phyX < _stripX0 || phyX >= _stripX0 + _stripW) {
+      return;  // pixel outside the band/window currently being rendered
     }
     target = _stripBuf;
+    target2 = _stripBuf2;
     rowY = static_cast<uint32_t>(phyY - _stripY0);
+    stride = static_cast<uint32_t>(_stripStride);
+    colX = phyX - _stripX0;  // _stripX0 is a multiple of 8, so the bit position is unchanged
   }
 
   // Calculate byte position and bit position
-  const uint32_t byteIndex = rowY * panelWidthBytes + (phyX / 8);
+  const uint32_t byteIndex = rowY * stride + (colX / 8);
   const uint8_t bitPosition = 7 - (phyX % 8);  // MSB first
 
   if (state) {
     target[byteIndex] &= ~(1 << bitPosition);  // Clear bit
+    if (target2) target2[byteIndex] &= ~(1 << bitPosition);
   } else {
     target[byteIndex] |= 1 << bitPosition;  // Set bit
+    if (target2) target2[byteIndex] |= 1 << bitPosition;
   }
 }
 
@@ -1063,6 +1078,19 @@ void GfxRenderer::fillRectImpl(const int x, const int y, const int width, const 
   if (width <= 0 || height <= 0) return;
   if (fontCacheManager_ && fontCacheManager_->isScanning()) return;
 
+  // Dual-plane window target: fill each plane in turn (the second pass writes _stripBuf2).
+  if (_stripActive && _stripBuf2 != nullptr) {
+    uint8_t* const buf1 = _stripBuf;
+    uint8_t* const buf2 = _stripBuf2;
+    _stripBuf2 = nullptr;
+    fillRectImpl<C>(x, y, width, height);
+    _stripBuf = buf2;
+    fillRectImpl<C>(x, y, width, height);
+    _stripBuf = buf1;
+    _stripBuf2 = buf2;
+    return;
+  }
+
   // Clip in logical space.
   const int screenW = getScreenWidth();
   const int screenH = getScreenHeight();
@@ -1079,8 +1107,8 @@ void GfxRenderer::fillRectImpl(const int x, const int y, const int width, const 
   rotateCoordinates(orientation, lx0, ly0, &paX, &paY, panelWidth, panelHeight);
   rotateCoordinates(orientation, lx1 - 1, ly1 - 1, &pbX, &pbY, panelWidth, panelHeight);
 
-  const int phyX0 = std::min(paX, pbX);
-  const int phyX1 = std::max(paX, pbX);  // inclusive
+  int phyX0 = std::min(paX, pbX);
+  int phyX1 = std::max(paX, pbX);  // inclusive
   int phyY0 = std::min(paY, pbY);
   int phyY1 = std::max(paY, pbY);
 
@@ -1092,13 +1120,23 @@ void GfxRenderer::fillRectImpl(const int x, const int y, const int width, const 
   phyY1 = std::min(phyY1, originY + writeRows - 1);
   if (phyY0 > phyY1) return;
 
+  // Window target: clip X to the window. Dither fills are not drawn into windows (the
+  // window path only serves grayscale text planes).
+  const int originX = getWriteOriginX();
+  if (originX != 0 || getWriteWidth() != panelWidth) {
+    if constexpr (C != Color::Black && C != Color::White) return;
+    phyX0 = std::max(phyX0, originX);
+    phyX1 = std::min(phyX1, originX + getWriteWidth() - 1);
+    if (phyX0 > phyX1) return;
+  }
+
   // Bit/byte layout: MSB-first within a byte, so phyX → bit (7 - (phyX & 7)).
   // Head and tail masks cover only the in-rect bits of the first/last byte.
-  const int byteStart = phyX0 >> 3;
-  const int byteEnd = phyX1 >> 3;  // inclusive
+  const int byteStart = (phyX0 - originX) >> 3;
+  const int byteEnd = (phyX1 - originX) >> 3;  // inclusive
   const uint8_t headMask = static_cast<uint8_t>(0xFFu >> (phyX0 & 7));
   const uint8_t tailMask = static_cast<uint8_t>(0xFFu << (7 - (phyX1 & 7)));
-  const int32_t panelStride = static_cast<int32_t>(panelWidthBytes);
+  const int32_t panelStride = static_cast<int32_t>(getWriteStride());
 
   if constexpr (C == Color::Black || C == Color::White) {
     // Solid fill. Framebuffer: 0 = black, 1 = white.
@@ -1705,7 +1743,8 @@ void GfxRenderer::clearScreen(const uint8_t color) const {
   start_ms = millis();
   if (_stripActive) {
     // Clear only the active band's scratch, not the shared framebuffer.
-    memset(_stripBuf, color, static_cast<size_t>(panelWidthBytes) * _stripRows);
+    memset(_stripBuf, color, static_cast<size_t>(_stripStride) * _stripRows);
+    if (_stripBuf2) memset(_stripBuf2, color, static_cast<size_t>(_stripStride) * _stripRows);
     return;
   }
   display.clearScreen(color);
@@ -1717,16 +1756,47 @@ void GfxRenderer::beginStripTarget(uint8_t* scratch, int stripY0, int stripRows)
   // the downstream uint16_t cast in writeGrayscalePlaneStrip.
   assert(scratch != nullptr && stripRows > 0 && stripY0 >= 0 && stripY0 <= static_cast<int>(panelHeight) - stripRows);
   _stripBuf = scratch;
+  _stripBuf2 = nullptr;
   _stripY0 = stripY0;
   _stripRows = stripRows;
+  _stripX0 = 0;
+  _stripW = panelWidth;
+  _stripStride = panelWidthBytes;
   _stripActive = true;
+}
+
+void GfxRenderer::beginWindowTarget(uint8_t* buf, int x, int y, int w, int h, uint8_t* buf2) const {
+  assert(buf != nullptr && w > 0 && h > 0 && x >= 0 && y >= 0 && (x & 7) == 0 && (w & 7) == 0 &&
+         x + w <= static_cast<int>(panelWidth) && y + h <= static_cast<int>(panelHeight));
+  _stripBuf = buf;
+  _stripBuf2 = buf2;
+  _stripY0 = y;
+  _stripRows = h;
+  _stripX0 = x;
+  _stripW = w;
+  _stripStride = w / 8;
+  _stripActive = true;
+}
+
+bool GfxRenderer::logicalRectToPanelRect(int lx, int ly, int lw, int lh, int* x, int* y, int* w, int* h) const {
+  const AlignedMemRect r = screenRectToAlignedMemRect(orientation, lx, ly, lw, lh, panelWidth, panelHeight);
+  if (!r.valid) return false;
+  *x = r.x;
+  *y = r.y;
+  *w = r.w;
+  *h = r.h;
+  return true;
 }
 
 void GfxRenderer::endStripTarget() const {
   _stripActive = false;
   _stripBuf = nullptr;
+  _stripBuf2 = nullptr;
   _stripY0 = 0;
   _stripRows = 0;
+  _stripX0 = 0;
+  _stripW = 0;
+  _stripStride = 0;
 }
 
 bool GfxRenderer::glyphIntersectsStrip(int x0, int y0, int x1, int y1) const {
@@ -1741,7 +1811,9 @@ bool GfxRenderer::glyphIntersectsStrip(int x0, int y0, int x1, int y1) const {
   rotateCoordinates(orientation, x1, y1, &bx, &by, panelWidth, panelHeight);
   const int minY = ay < by ? ay : by;
   const int maxY = ay > by ? ay : by;
-  return !(maxY < _stripY0 || minY >= _stripY0 + _stripRows);
+  const int minX = ax < bx ? ax : bx;
+  const int maxX = ax > bx ? ax : bx;
+  return !(maxY < _stripY0 || minY >= _stripY0 + _stripRows || maxX < _stripX0 || minX >= _stripX0 + _stripW);
 }
 
 void GfxRenderer::invertScreen() const {
@@ -2451,6 +2523,19 @@ void GfxRenderer::writeGrayscalePlaneStrip(bool lsbPlane, const uint8_t* scratch
   // Guard the uint16_t casts below: a negative would wrap to a huge length.
   assert(yStart >= 0 && numRows > 0 && yStart <= static_cast<int>(panelHeight) - numRows);
   display.writeGrayscalePlaneStrip(lsbPlane, scratch, static_cast<uint16_t>(yStart), static_cast<uint16_t>(numRows));
+}
+
+bool GfxRenderer::supportsGrayscaleWindow() const { return display.supportsGrayscaleWindow(); }
+
+void GfxRenderer::declareGrayscaleWindowsComplete() const { display.declareGrayscaleWindowsComplete(); }
+
+bool GfxRenderer::writeGrayscalePlaneWindow(bool lsbPlane, const uint8_t* data, int x, int y, int w, int h) const {
+  if (x < 0 || y < 0 || w <= 0 || h <= 0 || x + w > static_cast<int>(panelWidth) ||
+      y + h > static_cast<int>(panelHeight)) {
+    return false;
+  }
+  return display.writeGrayscalePlaneWindow(lsbPlane, data, static_cast<uint16_t>(x), static_cast<uint16_t>(y),
+                                           static_cast<uint16_t>(w), static_cast<uint16_t>(h));
 }
 
 bool GfxRenderer::supportsStripGrayscale() const { return grayscaleCapabilities().stripUploads; }

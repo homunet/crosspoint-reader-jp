@@ -152,6 +152,16 @@ void HalDisplay::writeGrayscalePlaneStrip(bool lsbPlane, const uint8_t* rows, ui
 
 bool HalDisplay::supportsStripGrayscale() const { return grayscaleCapabilities().stripUploads; }
 
+bool HalDisplay::supportsGrayscaleWindow() const { return einkDisplay.supportsGrayscaleWindow(); }
+
+void HalDisplay::declareGrayscaleWindowsComplete() { einkDisplay.declareGrayscaleWindowsComplete(); }
+
+bool HalDisplay::writeGrayscalePlaneWindow(bool lsbPlane, const uint8_t* data, uint16_t x, uint16_t y, uint16_t w,
+                                           uint16_t h) {
+  return einkDisplay.writeGrayscalePlaneWindow(lsbPlane ? EInkDisplay::GRAY_PLANE_LSB : EInkDisplay::GRAY_PLANE_MSB,
+                                               data, x, y, w, h);
+}
+
 bool HalDisplay::combinesGrayscaleBase() const { return grayscaleCapabilities().base == GrayscaleBase::Combined; }
 
 uint16_t HalDisplay::getDisplayWidth() const { return einkDisplay.getDisplayWidth(); }
