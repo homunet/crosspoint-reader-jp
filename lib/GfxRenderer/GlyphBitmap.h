@@ -31,6 +31,13 @@ struct Target {
   int originY;      // First physical row held by buffer
   int rows;         // Number of physical rows held by buffer
   Frame frame;      // Physical placement of the glyph
+  // Optional second buffer with the same geometry as `buffer`. When set and the plane is a
+  // gray plane, one pass paints the LSB plane into `buffer` and the MSB plane into `buffer2`.
+  uint8_t* buffer2 = nullptr;
+  // With buffer2: paint absolute 4-level planes (white = 11, black = 00, dark = LSB 1 / MSB 0,
+  // light = LSB 0 / MSB 1) by clearing bits in buffers pre-filled with 0xFF, instead of the
+  // overlay masks.
+  bool absoluteLevels = false;
 };
 
 // Half-open rectangle in glyph-local pixel coordinates.
@@ -89,10 +96,12 @@ __attribute__((always_inline)) inline void paint(uint8_t* buffer, int destinatio
 //   honours state (true clears the bit, i.e. black). The gray planes only ever
 //   set bits, because there 0 means leave alone and 1 means update: MSB paints
 //   both grays, LSB paints dark gray only. 1bpp glyphs paint ink with state on
-//   every plane.
+//   every plane. With target.buffer2 set, a gray-plane draw paints LSB into buffer and
+//   MSB into buffer2 in one pass (plane then only selects gray vs B/W).
 // Clipping happens before pixel decoding, so fully hidden glyphs cost nothing.
-inline void draw(const uint8_t* bitmap, int width, int height, bool twoBit, Plane plane, bool state,
-                 const Target& target, Clip clip) {
+template <bool Dual>
+inline void drawPlanes(const uint8_t* bitmap, int width, int height, bool twoBit, Plane plane, bool state,
+                       const Target& target, Clip clip) {
   // Bit n of levels set means source value n is painted.
   uint8_t levels = 0x02;
   bool clearBits = state;
@@ -100,6 +109,26 @@ inline void draw(const uint8_t* bitmap, int width, int height, bool twoBit, Plan
     levels = plane == Plane::BW ? 0x0e : plane == Plane::GrayMSB ? 0x06 : 0x04;
     if (plane != Plane::BW) clearBits = false;
   }
+  // Dual: `levels` selects the LSB plane (buffer), `levels2` the MSB plane (buffer2).
+  uint8_t levels2 = 0x02;
+  if constexpr (Dual) {
+    if (target.absoluteLevels) {
+      // Clear LSB for light (1) and black (3); clear MSB for dark (2) and black (3).
+      levels = twoBit ? 0x0A : 0x02;
+      levels2 = twoBit ? 0x0C : 0x02;
+      clearBits = true;
+    } else {
+      if (twoBit) {
+        levels = 0x04;
+        levels2 = 0x06;
+      }
+      clearBits = false;
+    }
+  }
+  const auto put = [&](int destination, uint8_t ink) {
+    paint(target.buffer, destination, ink, levels, clearBits);
+    if constexpr (Dual) paint(target.buffer2, destination, ink, levels2, clearBits);
+  };
 
   // Intersect with the glyph bounds, then with the panel width and the
   // buffered row band.
@@ -125,17 +154,17 @@ inline void draw(const uint8_t* bitmap, int width, int height, bool twoBit, Plan
     if (twoBit) {
       // Rows are bit-contiguous, not byte-padded. Align after any clipped prefix.
       while (remaining && (source & 3)) {
-        paint(target.buffer, destination, (bitmap[source >> 2] >> (6 - (source & 3) * 2)) & 3, levels, clearBits);
+        put(destination, (bitmap[source >> 2] >> (6 - (source & 3) * 2)) & 3);
         ++source;
         destination += stepX;
         --remaining;
       }
       while (remaining >= 4) {
         const uint8_t packed = bitmap[source >> 2];
-        paint(target.buffer, destination, packed >> 6, levels, clearBits);
-        paint(target.buffer, destination + stepX, (packed >> 4) & 3, levels, clearBits);
-        paint(target.buffer, destination + 2 * stepX, (packed >> 2) & 3, levels, clearBits);
-        paint(target.buffer, destination + 3 * stepX, packed & 3, levels, clearBits);
+        put(destination, packed >> 6);
+        put(destination + stepX, (packed >> 4) & 3);
+        put(destination + 2 * stepX, (packed >> 2) & 3);
+        put(destination + 3 * stepX, packed & 3);
         source += 4;
         destination += 4 * stepX;
         remaining -= 4;
@@ -145,10 +174,19 @@ inline void draw(const uint8_t* bitmap, int width, int height, bool twoBit, Plan
     while (remaining--) {
       const uint8_t ink = twoBit ? ((bitmap[source >> 2] >> (6 - (source & 3) * 2)) & 3)
                                  : ((bitmap[source >> 3] >> (7 - (source & 7))) & 1);
-      paint(target.buffer, destination, ink, levels, clearBits);
+      put(destination, ink);
       ++source;
       destination += stepX;
     }
+  }
+}
+
+inline void draw(const uint8_t* bitmap, int width, int height, bool twoBit, Plane plane, bool state,
+                 const Target& target, Clip clip) {
+  if (target.buffer2 != nullptr && plane != Plane::BW) {
+    drawPlanes<true>(bitmap, width, height, twoBit, plane, state, target, clip);
+  } else {
+    drawPlanes<false>(bitmap, width, height, twoBit, plane, state, target, clip);
   }
 }
 

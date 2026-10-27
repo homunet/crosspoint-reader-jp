@@ -124,3 +124,67 @@ TEST(GlyphBitmap, EmptyAndFullyClippedGlyphsDoNotWrite) {
     }
   }
 }
+
+namespace {
+// Pseudo-random 2bpp glyph so that every value 0..3 occurs.
+std::vector<uint8_t> patternBitmap(int width, int height, bool twoBit) {
+  std::vector<uint8_t> bitmap((width * height * (twoBit ? 2 : 1) + 7) / 8 + 1);
+  for (size_t i = 0; i < bitmap.size(); ++i) bitmap[i] = static_cast<uint8_t>(i * 91 + 0x2d);
+  return bitmap;
+}
+}  // namespace
+
+// One pass with a second buffer paints the LSB plane into `buffer` and the MSB plane into
+// `buffer2`, exactly as two separate single-plane passes would.
+TEST(GlyphBitmap, DualPlaneMatchesSeparateLsbAndMsbPasses) {
+  for (const auto& axes : AXES) {
+    for (bool twoBit : {false, true}) {
+      for (const auto [x, y] : {std::pair{-4, -2}, std::pair{3, 5}, std::pair{30, 20}}) {
+        const int width = 13;
+        const int height = 11;
+        const auto bitmap = patternBitmap(width, height, twoBit);
+        const glyphBitmap::Frame frame{x, y, axes[0], axes[1], axes[2], axes[3]};
+        glyphBitmap::Clip clip{0, 0, width, height};
+        std::vector<uint8_t> lsb(PANEL_HEIGHT * STRIDE, 0), msb(PANEL_HEIGHT * STRIDE, 0);
+        auto expectedLsb = lsb;
+        auto expectedMsb = msb;
+        glyphBitmap::draw(bitmap.data(), width, height, twoBit, Plane::GrayLSB, false,
+                          {expectedLsb.data(), PANEL_WIDTH, STRIDE, 0, PANEL_HEIGHT, frame}, clip);
+        glyphBitmap::draw(bitmap.data(), width, height, twoBit, Plane::GrayMSB, false,
+                          {expectedMsb.data(), PANEL_WIDTH, STRIDE, 0, PANEL_HEIGHT, frame}, clip);
+        glyphBitmap::draw(bitmap.data(), width, height, twoBit, Plane::GrayLSB, false,
+                          {lsb.data(), PANEL_WIDTH, STRIDE, 0, PANEL_HEIGHT, frame, msb.data()}, clip);
+        EXPECT_EQ(expectedLsb, lsb);
+        EXPECT_EQ(expectedMsb, msb);
+      }
+    }
+  }
+}
+
+// Absolute levels: both planes start white (0xFF); light ink clears the LSB bit, dark ink the
+// MSB bit, black ink both. White (value 0) leaves the pixel alone.
+TEST(GlyphBitmap, AbsoluteDualPlaneClearsBitsPerLevel) {
+  const int width = 9;
+  const int height = 7;
+  const auto bitmap = patternBitmap(width, height, true);
+  const int fx = 5;
+  const int fy = 3;
+  std::vector<uint8_t> lsb(PANEL_HEIGHT * STRIDE, 0xFF), msb(PANEL_HEIGHT * STRIDE, 0xFF);
+  auto expectedLsb = lsb;
+  auto expectedMsb = msb;
+  for (int gy = 0; gy < height; ++gy) {
+    for (int gx = 0; gx < width; ++gx) {
+      const int source = gy * width + gx;
+      const int raw = (bitmap[source / 4] >> ((3 - source % 4) * 2)) & 3;  // 0 white, 1 light, 2 dark, 3 black
+      const int px = fx + gx;
+      const int py = fy + gy;
+      const uint8_t mask = static_cast<uint8_t>(0x80 >> (px % 8));
+      if (raw == 1 || raw == 3) expectedLsb[py * STRIDE + px / 8] &= static_cast<uint8_t>(~mask);
+      if (raw == 2 || raw == 3) expectedMsb[py * STRIDE + px / 8] &= static_cast<uint8_t>(~mask);
+    }
+  }
+  glyphBitmap::Target target{lsb.data(), PANEL_WIDTH, STRIDE, 0, PANEL_HEIGHT, {fx, fy, 1, 0, 0, 1}, msb.data(), true};
+  glyphBitmap::draw(bitmap.data(), width, height, true, Plane::GrayLSB, false, target, {0, 0, width, height});
+  EXPECT_EQ(expectedLsb, lsb);
+  EXPECT_EQ(expectedMsb, msb);
+}
