@@ -2029,8 +2029,16 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
   const bool absoluteImageGrayscale = pageHasImages && !gpio.deviceIsX3() &&
                                       display.getController() == HalDisplay::Controller::UC8279 &&
                                       renderer.grayscaleCapabilities(HalDisplay::GrayscaleMode::Absolute).supported();
-  const auto grayscale = renderer.grayscaleCapabilities(absoluteImageGrayscale ? HalDisplay::GrayscaleMode::Absolute
-                                                                               : HalDisplay::GrayscaleMode::Overlay);
+  // Show text pages with the factory 4-level waveform: one refresh straight to the final
+  // anti-aliased page, with no B/W base. false = B/W base + gray overlay (two refreshes).
+  constexpr bool ABSOLUTE_TEXT_AA = true;
+  const bool absoluteTextGrayscale =
+      ABSOLUTE_TEXT_AA && needsTextGrayscale && !pageHasImages && !absoluteImageGrayscale && gpio.isXteinkDevice() &&
+      renderer.grayscaleCapabilities(HalDisplay::GrayscaleMode::Absolute).supported() &&
+      renderer.supportsGrayscaleWindow();
+  const auto grayscale = renderer.grayscaleCapabilities(absoluteImageGrayscale || absoluteTextGrayscale
+                                                            ? HalDisplay::GrayscaleMode::Absolute
+                                                            : HalDisplay::GrayscaleMode::Overlay);
   const bool tiledGrayscale = needsAnyGrayscale && grayscale.stripUploads;
   // Paper Mono only (no other panel combines): defer the B/W base activation so
   // the gray planes join it in a single waveform. Displaying the base
@@ -2048,7 +2056,7 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
       page->renderImages(renderer, fontId, orientedMarginLeft, orientedMarginTop);
     }
     // A4 replaces the whole frame with its gray planes, including the status bar.
-    if (absoluteImageGrayscale || BoardConfig::isEegoA4()) renderStatusBar();
+    if (absoluteImageGrayscale || absoluteTextGrayscale || BoardConfig::isEegoA4()) renderStatusBar();
   };
 
   if (pageHasImagesNeedingDecode) {
@@ -2063,7 +2071,14 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
   renderStatusBar();
   const auto tBwRender = millis();
 
-  if (absoluteImageGrayscale) {
+  if (absoluteTextGrayscale) {
+    // No B/W base: the gray pass below is the only refresh of this page.
+    if (!renderer.displayGrayscaleBase(HalDisplay::GrayscaleMode::Absolute, HalDisplay::FAST_REFRESH)) {
+      LOG_ERR("ERS", "Absolute text page unavailable; displaying B/W");
+      ReaderUtils::displayWithRefreshCycle(renderer, pagesUntilFullRefresh);
+      return;
+    }
+  } else if (absoluteImageGrayscale) {
     const auto baseMode = cleanImageBasePending ? HalDisplay::HALF_REFRESH : HalDisplay::FAST_REFRESH;
     if (!renderer.displayGrayscaleBase(HalDisplay::GrayscaleMode::Absolute, baseMode)) {
       LOG_ERR("ERS", "Could not start absolute image page; displaying B/W");
@@ -2117,16 +2132,120 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
       }
     };
 
+    // Banded gray planes: the page is split into horizontal bands of the LOGICAL screen and
+    // each band is rendered ONCE: text is painted into two small window buffers (LSB and MSB
+    // plane) in the same page walk, and both are written into the matching controller-RAM
+    // window. The bands tile the whole panel, so after the last band every RAM cell holds
+    // gray-plane data and a single gray waveform finishes the page.
+    // Heap: two window buffers (~9.6 KB each for 5 bands on the 800x480 panel) taken as one
+    // block, instead of one 48 KB plane buffer; needed because the free heap is often
+    // fragmented. Needs SSD1677 window writes; otherwise the original paths below run.
+    constexpr int GRAY_BANDS_MAX = 16;
+    constexpr size_t GRAY_ALLOC_RESERVE = 4 * 1024;
+    struct GrayBand {
+      int ly, lh;      // logical rows covered
+      int x, y, w, h;  // physical window (x and w multiples of 8)
+    };
+    GrayBand grayBands[GRAY_BANDS_MAX] = {};
+    int grayBandCount = 0;
+    size_t grayWinBytes = 0;
+    const int graySw = renderer.getScreenWidth();
+    const int graySh = renderer.getScreenHeight();
+    // Split the logical screen into `count` bands of equal height (multiple of 8 rows). Fails
+    // unless the physical windows tile the panel exactly (no gap, no overlap).
+    const auto planGrayBands = [&](const int count) {
+      const int bandH = (((graySh + count - 1) / count) + 7) & ~7;
+      const int n = (graySh + bandH - 1) / bandH;
+      if (n > GRAY_BANDS_MAX) return false;
+      size_t maxBytes = 0;
+      size_t coveredPixels = 0;
+      for (int c = 0; c < n; c++) {
+        auto& band = grayBands[c];
+        band.ly = c * bandH;
+        band.lh = (graySh - band.ly < bandH) ? (graySh - band.ly) : bandH;
+        if (!renderer.logicalRectToPanelRect(0, band.ly, graySw, band.lh, &band.x, &band.y, &band.w, &band.h) ||
+            static_cast<size_t>(band.w / 8) * band.h > 0xFFFF) {
+          return false;
+        }
+        maxBytes = std::max(maxBytes, static_cast<size_t>(band.w / 8) * band.h);
+        coveredPixels += static_cast<size_t>(band.w) * band.h;
+      }
+      if (coveredPixels != static_cast<size_t>(gwBytes) * 8 * gh) return false;
+      grayBandCount = n;
+      grayWinBytes = maxBytes;
+      return true;
+    };
+    // Smallest number of bands, starting at 5 (20% each), whose buffers fit the largest free block.
+    std::unique_ptr<uint8_t[]> grayMem;
+    if ((overlapRefresh || absoluteTextGrayscale) && gpio.isXteinkDevice() && renderer.supportsGrayscaleWindow()) {
+      for (const int candidate : {5, 6, 7, 8, 10, 12, 14}) {
+        if (!planGrayBands(candidate)) continue;
+        const size_t need = 2 * grayWinBytes;
+        if (need + GRAY_ALLOC_RESERVE > ESP.getMaxAllocHeap()) continue;
+        grayMem = makeUniqueNoThrow<uint8_t[]>(need);
+        if (grayMem) break;
+      }
+    }
+    const bool bandedGray = grayMem != nullptr;
+    uint8_t* const grayWinLsb = bandedGray ? grayMem.get() : nullptr;
+    uint8_t* const grayWinMsb = bandedGray ? grayMem.get() + grayWinBytes : nullptr;
+
     constexpr size_t PLANE_BUF_HEADROOM = 60000;
     constexpr size_t PLANE_BUF_MAX_ALLOC_RESERVE = 16 * 1024;
     const auto planeBufFits = [planeBytes] {
       return ESP.getFreeHeap() >= planeBytes + PLANE_BUF_HEADROOM &&
              ESP.getMaxAllocHeap() >= planeBytes + PLANE_BUF_MAX_ALLOC_RESERVE;
     };
-    auto lsbPlaneBuf = (overlapRefresh && planeBufFits()) ? makeUniqueNoThrow<uint8_t[]>(planeBytes) : nullptr;
+    auto lsbPlaneBuf = (overlapRefresh && !bandedGray && planeBufFits()) ? makeUniqueNoThrow<uint8_t[]>(planeBytes) : nullptr;
     auto msbPlaneBuf = (lsbPlaneBuf && planeBufFits()) ? makeUniqueNoThrow<uint8_t[]>(planeBytes) : nullptr;
 
-    if (lsbPlaneBuf) {
+    if (bandedGray) {
+      // One page walk fills both gray planes of the band, clipped to the logical band.
+      auto renderBandPlanes = [&](const GrayBand& band) {
+        renderer.setRenderMode(GfxRenderer::GRAYSCALE_LSB);  // dual target: LSB -> buf, MSB -> buf2
+        renderer.setClipRect(0, band.ly, graySw, band.lh);
+        renderer.beginWindowTarget(grayWinLsb, band.x, band.y, band.w, band.h, grayWinMsb);
+        renderer.clearScreen(absoluteTextGrayscale ? 0xFF : 0x00);  // absolute planes start white
+        renderGrayscalePass();
+        renderer.endStripTarget();
+      };
+
+      const auto savedClip = renderer.getClipRect();
+      bool bandsOk = true;
+      for (int c = 0; c < grayBandCount && bandsOk; c++) {
+        const auto& band = grayBands[c];
+        // Band 0 is rendered while the B/W refresh is still running.
+        renderBandPlanes(band);
+        if (c == 0 && !absoluteTextGrayscale) renderer.waitRefreshComplete();
+        bandsOk = renderer.writeGrayscalePlaneWindow(true, grayWinLsb, band.x, band.y, band.w, band.h) &&
+                  renderer.writeGrayscalePlaneWindow(false, grayWinMsb, band.x, band.y, band.w, band.h);
+      }
+      renderer.setClipRect(savedClip[0], savedClip[1], savedClip[2], savedClip[3]);
+      const auto tGrayWrite = millis();
+      if (bandsOk) {
+        if (absoluteTextGrayscale) renderer.declareGrayscaleWindowsComplete();
+        renderer.displayGrayBuffer();
+        renderer.setRenderMode(GfxRenderer::BW);  // after the display: BW would cancel a pending absolute pass
+      } else {
+        renderer.setRenderMode(GfxRenderer::BW);
+        // RAM holds a mix of gray and B/W data: keep the B/W page rather than show it.
+        LOG_ERR("ERS", "Banded gray: window write failed; keeping the B/W page");
+      }
+      const auto tGrayDisplay = millis();
+      // RED-RAM resync restores the differential baseline for the next page.
+      renderer.cleanupGrayscaleWithFrameBuffer();
+      const auto tEnd = millis();
+      LOG_DBG("ERS",
+              "Page render (banded gray%s, %d bands): prewarm=%lums bw_render=%lums display=%lums gray_render+write=%lums "
+              "gray_display=%lums cleanup=%lums total=%lums",
+              absoluteTextGrayscale ? " ABSOLUTE" : "", grayBandCount, tPrewarm - t0, tBwRender - tPrewarm, tDisplay - tBwRender, tGrayWrite - tDisplay,
+              tGrayDisplay - tGrayWrite, tEnd - tGrayDisplay, tEnd - t0);
+    } else if (absoluteTextGrayscale) {
+      // The absolute pass needs the banded buffers; without them keep a B/W page.
+      LOG_ERR("ERS", "Absolute text page: no buffers; displaying B/W");
+      renderer.setRenderMode(GfxRenderer::BW);  // cancels the pending absolute pass
+      ReaderUtils::displayWithRefreshCycle(renderer, pagesUntilFullRefresh);
+    } else if (lsbPlaneBuf) {
       renderPlaneToBuffer(true, lsbPlaneBuf.get());
       if (msbPlaneBuf) renderPlaneToBuffer(false, msbPlaneBuf.get());
       const auto tGrayRender = millis();
